@@ -1,0 +1,1070 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,mathtools,bm}
+\usepackage{booktabs,tabularx,array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage[dvipsnames]{xcolor} % Enables extra named colors (single load: fixes v2 option clash)
+\usepackage{microtype}
+\usepackage{graphicx}
+%\usepackage{xcolor}
+\usepackage{soul}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\SE}{\mathrm{SE}(3)}
+\newcommand{\SO}{\mathrm{SO}(3)}
+\newcommand{\softplus}{\operatorname{softplus}}
+\newcommand{\sigmoid}{\operatorname{sigmoid}}
+\newcommand{\normalize}{\operatorname{normalize}}
+\newcommand{\stopgrad}{\operatorname{sg}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\Sshade}{\mathcal{S}}
+\newcommand{\Lshade}{\mathcal{L}_{\mathrm{shade}}}
+\newcommand{\Lgeo}{\mathcal{L}_{\mathrm{geo}}}
+\newcommand{\LGA}{\mathcal{L}_{\mathrm{GA}}}
+\newcommand{\Loss}{\mathcal{L}}
+
+\title{\textbf{LA-DUSt3R: Light-Aware, Pose-Free Multi-View 3D Reconstruction}\\
+\large A Physically Informed Extension of DUSt3R (revised v4.1)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We propose LA-DUSt3R, a light-aware extension of DUSt3R for feed-forward
+multi-view 3D reconstruction under controlled near-field illumination.
+The method combines DUSt3R's pose-free pairwise pointmap prediction and
+geometric global alignment with light-conditioned features, pointmap-derived
+surface normals, diffuse-albedo prediction, a differentiable direct-illumination
+image-formation model, and photometric supervision during network training.
+The initial formulation uses camera-attached point lights with recorded
+renderer-space positions and controlled intensity settings, a fixed and
+consistent rendering pipeline, and approximately Lambertian materials.
+These assumptions define a controlled synthetic experiment, not a
+radiometrically calibrated capture system. More general reflectance and
+light-transport models are deferred.
+
+A central design requirement is that the training-time photometric objective
+needs no camera poses. For each ordered image pair, DUSt3R's reference head
+predicts a pointmap in that view's own camera frame; running the swapped pair
+yields the other view's camera-local pointmap. Shading is evaluated on these
+camera-local pointmaps against camera-local light coordinates, so no relative
+pose enters the photometric loss. Ground-truth poses are used only to build
+the geometric supervision targets already required by DUSt3R.
+
+Photometric supervision is used to shape the network's learned geometric
+representation during training. At inference, the trained network predicts
+pairwise pointmaps and geometric confidence, and the standard DUSt3R geometric
+global-alignment procedure estimates camera poses, focal lengths, and globally
+consistent geometry. No photometric-family objective, albedo optimization,
+shading refinement, or depth-residual optimization is added to scene
+optimization. Albedo and photometric-reliability outputs remain auxiliary
+predictions and are not required by geometric global alignment. Metric scale
+is supplied by metric geometric supervision; recovery of absolute scale from
+illumination is not investigated.
+\end{abstract}
+
+\tableofcontents
+
+\section{Motivation and Research Objective}
+
+DUSt3R formulates unconstrained multi-view reconstruction as pairwise
+regression of dense pointmaps, without requiring camera poses or intrinsics
+as inputs. For image collections, its global alignment procedure reconciles
+pairwise predictions in a common reference frame
+\cite{wang2024dust3r}. This provides a strong geometric prior, but the
+standard reconstruction objective is primarily geometric and does not
+explicitly model the illumination process that generated the input images.
+
+Recent point-based inverse-rendering methods demonstrate that known
+illumination can provide useful constraints on geometry and appearance.
+Gjerde et al.\ formulate differentiable point rendering under known
+illumination, while Jiang et al.\ develop differentiable light transport
+with Gaussian surfels using an adapted radiosity formulation
+\cite{gjerde2026point,jiang2025radiositygs}. LA-DUSt3R investigates a
+different operating point: retain DUSt3R's feed-forward, pose-free geometric
+prior and use a comparatively simple direct-illumination model as an
+additional training-time supervision signal.
+
+The central research question is:
+
+\begin{quote}
+Can controlled-illumination supervision during training improve the
+geometric reconstruction produced by a pose-free, feed-forward multi-view
+model, when inference retains standard geometry-driven global alignment?
+\end{quote}
+
+The initial contribution is not a general inverse-rendering system. It is a
+controlled integration of a learned geometric prior and a differentiable
+per-pixel image-formation model. The first version deliberately assumes
+Lambertian reflectance and direct illumination. Specular BRDFs, indirect
+illumination, radiosity, and more general light transport are outside the
+initial scope.
+
+\subsection{Research hypotheses}
+
+The design is organized around the following falsifiable hypotheses:
+\begin{enumerate}[label=\textbf{H\arabic*.}]
+  \item Photometric supervision under controlled near-field illumination
+  improves surface orientation and fine-scale geometry beyond geometric
+  DUSt3R supervision alone.
+  \item Jointly learning diffuse albedo and photometric reliability with
+  pointmap-derived shading supervision improves the geometric representation,
+  while surface orientation remains derived from the pointmap. The initial
+  study evaluates per-view albedo; cross-view albedo tying is deferred.
+  \item Light-conditioned feature representations improve reconstruction
+  \emph{when the camera-frame illumination varies across views} (for
+  example, randomized light offsets and intensities in synthetic data),
+  beyond the effect of additional synthetic training data alone. For a rigid
+  rig with constant light offsets this hypothesis is not testable, since the
+  conditioning signal is constant.
+\end{enumerate}
+
+\section{Problem Formulation and Assumptions}
+
+\subsection{Inputs and outputs}
+
+Let a scene be observed by $N$ cameras. The input consists of images
+\[
+  \mathcal{I}=\{I_n\}_{n=1}^{N},
+  \qquad
+  I_n:\Omega_n\rightarrow\R^3,
+\]
+and recorded per-image light sets
+\[
+  \mathcal{Q}_n
+  =
+  \left\{
+    (\bm{\ell}_{n,k},\bm{E}_{n,k})
+  \right\}_{k=1}^{K_n}.
+\]
+Here, $\bm{\ell}_{n,k}\in\R^3$ is the position of point light $k$ in
+camera $n$'s coordinate frame, and
+$\bm{E}_{n,k}\in\R_{\geq 0}^{3}$ is its RGB renderer-intensity parameter under the selected
+rendering configuration; it is not assumed to be a physically calibrated
+radiant intensity.
+
+The camera poses and intrinsics are not supplied at inference. The network
+predicts pairwise pointmaps and geometric confidence, together with auxiliary
+diffuse-albedo and photometric-reliability outputs. Surface normals are
+derived from pointmaps when needed for training-time shading supervision or
+evaluation. Inference-time geometric global alignment uses the pointmaps and
+geometric confidence; it does not optimize albedo, reliability, or shading.
+
+The initial setting assumes:
+\begin{itemize}
+  \item camera-attached point lights (e.g.\ a simulated flash or a
+  camera-mounted light rig), with their positions and renderer settings recorded;
+  \item all $K_n$ lights of a view are on simultaneously, so each image is a
+  single summed-illumination observation (one-light-at-a-time multi-exposure
+  capture is not assumed);
+  \item a consistent rendering and image-encoding pipeline, with fixed exposure
+  and tone-mapping settings; if the renderer provides linear RGB, it is used
+  directly, otherwise a fixed documented conversion is applied;
+  \item direct-dominant illumination and diffuse-dominant materials; ambient
+  illumination is disabled or held fixed and recorded;
+  \item known foreground masks or a reliable procedure for obtaining them;
+  \item metric camera-relative light positions and controlled renderer-intensity
+  parameters (scene geometry and light positions are specified in meters).
+  These light parameters are supplied to the light-conditioned network at
+  inference when that conditioning pathway is enabled; they are not used in
+  a post-alignment photometric objective.
+\end{itemize}
+These assumptions define the controlled Level-2 synthetic setting. Non-Lambertian
+materials and indirect illumination are acknowledged limitations and are
+reserved for later extensions.
+
+\subsection{Training-time and inference-time information}
+
+Ground-truth relative poses are available in the controlled training data
+and are used only for the geometric supervision that DUSt3R already
+requires (ground-truth pointmaps). They are not network inputs, and the
+photometric losses do not use them.
+
+\begin{center}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.31\textwidth}XX}
+\toprule
+Quantity & Training & Inference\\
+\midrule
+Images and recorded light parameters & Available & Available when light conditioning is enabled\\
+Ground-truth relative poses & Used only to build GT pointmaps & Unavailable\\
+Ground-truth depth/geometry & Available & Unavailable\\
+Ground-truth albedo & Available for synthetic supervision & Unavailable\\
+Predicted pointmaps and geometric confidence & Available & Used by geometric global alignment\\
+Predicted albedo and reliability & Supervised auxiliary outputs & Optional outputs; not used by global alignment\\
+Camera-local pointmaps and derived normals & Used by shading and normal losses & Not required for scene optimization\\
+Differentiable shading objective & Training only & Not evaluated\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+The photometric objective is pose-free during training. At inference, the
+reconstruction pipeline is geometry-driven: no shading loss or other
+photometric-family constraint is evaluated during scene optimization.
+
+No camera poses are supplied as input at inference; they are estimated by
+geometric global alignment. The photometric loss is also pose-free during
+training, because it uses camera-local pointmaps and camera-local light
+coordinates rather than pose-based frame conversion.
+
+\subsection{What shading can and cannot identify}
+\label{sec:ident}
+
+This subsection fixes expectations for the hypotheses above.
+\begin{itemize}
+  \item \textbf{Single effective light, per-view albedo.} With known
+  albedo, one observation gives one scalar equation per color channel in
+  the unit normal, which constrains the normal only to a cone around the
+  light direction, not to a unique vector. Pointmap derivatives supply the
+  tangent-plane structure, so shading acts as a shape-from-shading
+  constraint coupled to the geometric loss. It is not a free normal
+  measurement.
+  \item \textbf{Simultaneous lights.} $K$ lights that are on together are
+  summed into one image, so they give no more equations per pixel than one
+  effective light. Therefore, increasing $K$ is not expected to behave
+  like adding photometric-stereo exposures. Genuine multi-light constraints
+  require one-light-at-a-time exposures per viewpoint, which v1 does not
+  assume.
+  \item \textbf{Potential cross-view constraint.} With camera-attached
+  lights, the same surface point can be observed under different
+  camera-relative illumination directions. If albedo is tied across views,
+  these observations could provide a multi-view photometric-stereo constraint.
+  Cross-view albedo tying is deferred because reliable correspondences and
+  albedo consistency introduce additional variables; it is not needed by the
+  initial training objective or inference pipeline.
+  \item \textbf{Scale is not a target.} Under an inverse-square approximation, scaling all depths and
+  light-relative distances by $s$ while scaling albedo by $s^2$ can leave
+  image intensity approximately unchanged. This is an illustrative
+  ambiguity, not an assumption about the Level-2 renderer; the actual
+  relationship depends on its attenuation and appearance settings.
+  Metric scale from the Level-2 photometric signal is not treated as
+  identifiable or recoverable in this study. We do not investigate it: scale comes from the metric
+  ground-truth geometric supervision. No photometric term is evaluated
+  during inference-time global alignment.
+\end{itemize}
+
+\section{Architecture Overview}
+
+LA-DUSt3R consists of three functional components:
+\begin{enumerate}
+  \item \textbf{Light-conditioned DUSt3R backbone:} a DUSt3R encoder and
+  cross-view decoder augmented with per-view illumination conditioning.
+  \item \textbf{Dense prediction:} DUSt3R pointmaps and confidence are
+  retained, while diffuse-albedo and photometric-reliability heads are added. Normals are derived from the
+  pointmaps rather than predicted.
+  \item \textbf{Training-time differentiable geometry and shading operators:}
+  camera-local pointmaps are converted to normals, and a direct-illumination
+  Lambertian-like model supplies photometric supervision during training.
+  These operators are not part of inference-time scene optimization.
+\end{enumerate}
+
+\subsection{Light-conditioned feature extraction}
+
+For each view, the recorded light set is encoded independently. For
+light $k$ in view $n$, define
+\[
+  \bm{\tau}_{n,k}
+  =
+  \operatorname{MLP}_{\phi}
+  \left(
+    \left[
+      \gamma(\bm{\ell}_{n,k}),
+      \log(\bm{1}+\bm{E}_{n,k})
+    \right]
+  \right)
+  \in\R^{d},
+\]
+where $\gamma(\cdot)$ denotes a positional/Fourier feature mapping and
+$d$ is the decoder feature dimension.
+
+\paragraph{Default: light tokens in self-attention only.}
+The light tokens of view $n$ are appended to view $n$'s token sequence
+(without positional embedding) and are visible as keys \emph{only} to view
+$n$'s own self-attention. They are excluded from the keys of cross-attention,
+so view 2's tokens never attend to view 1's camera-frame light coordinates.
+Unlike a global modulation vector, tokens let each image token use the light
+information in a spatially varying way. This matters because a pixel's
+light direction depends on where it sits relative to the light. Note that
+relating $\bm\ell$ to pixel rays requires the focal length, which the network
+must infer implicitly.
+
+\paragraph{Ablation: FiLM.}
+View-local feature modulation
+$F_n'=\operatorname{FiLM}(F_n,e(\mathcal{Q}_n))$, with $e(\mathcal{Q}_n)$
+an aggregate of the encoded lights, is retained as an ablation. A single
+global modulation vector cannot encode per-pixel light geometry, so we
+expect it to be weaker.
+
+Implementation detail: at every conditioned self-attention block, append
+the view-local light tokens to that view's image-token sequence; image tokens
+may attend to these light tokens, while light tokens are excluded from all
+cross-view attention key/value sets. Remove light tokens before the dense
+prediction head so the spatial token count and patch ordering remain exactly
+those expected by the DUSt3R head. A learned null-light embedding and light
+dropout are used when training with mixed illuminated and non-illuminated
+data. Encoder-level versus
+decoder-level conditioning is an experimental variable, not a fixed
+assumption.
+
+\paragraph{When conditioning is informative.}
+For a rigid flash or ring-light rig, $\bm\ell_{n,k}$ is the same in every
+view, so the conditioning signal is constant and may be mostly absorbed into
+the weights. Hypothesis H3 is therefore tested on synthetic data with
+randomized light offsets and intensities (reported as such), and separately
+on a fixed-rig configuration to measure whether shading supervision helps
+even when explicit light conditioning carries little view-dependent information.
+
+\subsection{Dense prediction heads}
+
+For an ordered image pair $(I_a,I_b)$, DUSt3R predicts pointmaps for both views in
+the camera frame of the first image:
+\[
+  X^{a,a},\ X^{b,a}:\Omega\rightarrow\R^3,
+\]
+where $X^{a,a}$ is the reference view's pointmap in its own camera frame.
+For brevity, when the pair is $(I_1,I_2)$ we write $X^{v,1}$, $v\in\{1,2\}$.
+The extended prediction head produces
+\[
+  \left(
+    \widetilde X^{v,1},
+    \widetilde C^{v,1},
+    a_\rho^v,
+    \widetilde W^v
+  \right)
+  =
+  H_\theta(G^v),
+\]
+where $G^v$ denotes the decoder representation for view $v$. For lit
+metric samples the pointmap output is interpreted directly in meters,
+$X^{v,1}=\widetilde X^{v,1}$. The per-pixel parameterizations are:
+\begin{align}
+  C^{v,1} &= 1+\exp(\widetilde C^{v,1}),\\
+  \rho^v &= \rho_{\max}\sigmoid(a_\rho^v),\\
+  W^v &= \sigmoid(\widetilde W^v).
+\end{align}
+Here $C$ is the DUSt3R geometric confidence, $\rho$ is bounded RGB
+diffuse albedo in $[0,\rho_{\max}]$ (with $\rho_{\max}=1$ under
+the normalized reflectance convention), and $W\in(0,1)$ is a
+photometric-reliability weight. The bound is a modeling convention for
+normalized diffuse reflectance; renderer albedo metadata must use the same
+convention.
+The pointmap, confidence, albedo, and reliability outputs require
+$3+1+3+1=8$ channels per pixel.
+The original pointmap and confidence
+parameters are initialized from a DUSt3R checkpoint; the newly introduced
+albedo and reliability outputs are initialized separately.
+
+\section{Metric Data Convention and Camera-Local Pointmaps}
+
+\subsection{Metric data convention (scale is not a research target)}
+
+DUSt3R's original training mixture does not provide uniform metric ground
+truth and therefore uses scale-normalized geometric supervision. In the
+controlled synthetic subset, scene geometry, camera poses, and light
+positions are specified in meters. For these lit samples, the pointmap
+regression target is metric:
+\[
+  \ell_{\mathrm{3D}}(X^{v,1},\bar X^{v,1}),
+  \qquad \bar X^{v,1}\text{ expressed in meters}.
+\]
+Thus, metric scale is supplied by geometric supervision. We do not train an
+additional pair-scale head, introduce a new global metric-scale variable,
+or attempt to recover scale from illumination. Null-light and legacy
+samples retain the original normalized DUSt3R objective.
+
+The original pretrained DUSt3R baseline may remain scale-ambiguous. For
+shape comparisons, any evaluation-time scale alignment applied to that
+baseline must be reported explicitly; absolute-scale metrics should also be
+reported without that correction. No oracle scale is supplied to the
+LA-DUSt3R network or its inference-time optimizer. Metric-supervised
+LA-DUSt3R is trained to predict pointmaps in meters on the controlled
+synthetic subset.
+
+\subsection{Camera-local pointmaps for training-time shading supervision}
+
+The shading model needs each view's geometry in that view's own camera
+frame, where its light set $\mathcal{Q}_n$ is defined. DUSt3R already provides
+this without any pose. Run the network on both orderings of a pair:
+\[
+  \boxed{
+  X^{1,1}=\text{reference pointmap of }F(I_1,I_2),
+  \qquad
+  X^{2,2}=\text{reference pointmap of }F(I_2,I_1).
+  }
+\]
+DUSt3R's training already feeds each pair together with its inversion, and
+global alignment already uses both orderings, so this adds no new data
+requirement. Each reference pointmap is camera-local by construction.
+During training, shading is therefore evaluated per view:
+\[
+  \widehat I_1
+  =
+  \Sshade(X^{1,1},n_X(X^{1,1}),\rho^1,\mathcal{Q}_1),
+  \qquad
+  \widehat I_2
+  =
+  \Sshade(X^{2,2},n_X(X^{2,2}),\rho^2,\mathcal{Q}_2).
+\]
+Normals are computed from the camera-local pointmap, so pointmap derivatives
+and light coordinates share one coordinate frame. No camera-local light
+coordinate is compared with a point expressed in another camera's frame.
+
+\section{Training-Time Differentiable Geometry and Image Formation}
+
+\subsection{Depth back-projection}
+
+For a camera with centered principal point and focal length $f_n$, define
+\[
+  K_n =
+  \begin{bmatrix}
+    f_n & 0 & W_n/2\\
+    0 & f_n & H_n/2\\
+    0 & 0 & 1
+  \end{bmatrix}.
+\]
+Given depth $D_n(\bm p)$ at pixel
+$\bm p=(u,v)^\top$, the camera-local 3D point is
+\[
+  \bm x_n(\bm p)
+  =
+  D_n(\bm p)
+  K_n^{-1}
+  \begin{bmatrix}u\\v\\1\end{bmatrix}.
+\]
+When the network pointmap is already available, it is used directly. This
+back-projection relation is included to make the connection between depth,
+camera-local points, and pointmap-derived normals explicit; it does not
+introduce a separate inference-time depth-refinement variable.
+
+\subsection{Geometric normals}
+
+Normals are derived from the camera-local pointmap using finite
+differences:
+\[
+  \bm n_X(\bm p)
+  =
+  \mathcal N(\bm x)(\bm p)
+  =
+  \normalize
+  \left(
+    \frac{\partial\bm x}{\partial u}
+    \times
+    \frac{\partial\bm x}{\partial v}
+  \right).
+\]
+Here $\mathcal N$ denotes the pointmap-to-normal operator. The sign is chosen to satisfy the camera-facing convention,
+\[
+  \bm n_X(\bm p)^\top
+  \frac{\bm c_n-\bm x_n(\bm p)}
+       {\|\bm c_n-\bm x_n(\bm p)\|}
+  >0,
+\]
+where $\bm c_n$ is the camera center in its own frame (the origin).
+
+\paragraph{Discontinuity mask.}
+Pixels near depth discontinuities are excluded from normal-based losses. A
+criterion of the form $\|\nabla D\|/D<\tau$ also rejects legitimate
+grazing-angle surfaces, which are among the most informative for shading.
+Instead, compare the 3D spacing of neighboring points with the expected
+pixel footprint $D/f$:
+\[
+  M_{\mathrm{edge}}(\bm p)
+  =
+  \mathbb{1}
+  \left[
+    \max_{\bm q\in\mathcal N_4(\bm p)}
+    \left\|\bm x_n(\bm q)-\bm x_n(\bm p)\right\|
+    <
+    \tau_e\,\frac{D_n(\bm p)}{f_n}
+  \right].
+\]
+A surface at incidence angle $\theta$ has spacing $\approx D/(f\cos\theta)$,
+so $\tau_e\approx4$ keeps surfaces up to roughly $75^\circ$ from the
+view direction while still rejecting depth jumps.
+
+A lightly smoothed depth map may be used for finite differences, while
+the unsmoothed geometry remains available to the geometric objective.
+Finite differences must be validity-aware: neighborhoods
+crossing invalid pixels, foreground boundaries, or discontinuities
+are excluded from the shading objective. All binary validity and
+discontinuity masks are computed under stop-gradient (detached) semantics;
+predicted geometry must not reduce its loss by manipulating the mask. Central differences are used
+in smooth interior regions, with one-sided differences only where their
+validity can be established.
+
+\subsection{Direct-illumination Lambertian model}
+\label{sec:lambert}
+
+For a camera-local surface point $\bm x$, unit normal $\bm n$, RGB albedo
+$\bm\rho$, and point light $k$, define
+\[
+  \bm d_k=\bm\ell_k-\bm x,\qquad
+  r_k=\|\bm d_k\|_2,\qquad
+  \bm\omega_k=\frac{\bm d_k}{r_k}.
+\]
+The initial direct-illumination model is
+\[
+  \boxed{
+  \Sshade(\bm x,\bm n,\bm\rho,\mathcal Q,V)
+  =
+  \frac{g\bm\rho}{\pi}
+  \odot
+  \sum_{k=1}^{K}
+  \bm E_k V_k\,\mathcal A_k^{\mathrm{rend}}(r_k)
+  \max(0,\bm n^\top\bm\omega_k).
+  }
+\]
+Here $g$ is a fixed global rendering gain, $V_k\in[0,1]$ is visibility,
+and $\odot$ denotes channel-wise multiplication. The attenuation
+$\mathcal A_k^{\mathrm{rend}}$ is the configured renderer-space
+attenuation function (or a documented approximation to it); it is not
+assumed to be an inverse-square law. In the first controlled experiment,
+visibility is set to $V_k=1$, and exposure, tone mapping, and renderer
+settings are held fixed across the dataset.
+The analytic shading surrogate is differentiable with respect to point
+positions, normals, and albedo. It approximates the selected renderer
+configuration; it is not claimed to reproduce the complete rendering
+pipeline.
+
+This model is intentionally Lambertian and direct-only. The use of
+robust losses and reliability weights is intended to reduce the influence
+of pixels that violate the simplified model; it does not make the model
+physically complete. Specular reflection, indirect illumination,
+translucency, and radiosity are future extensions.
+
+\paragraph{Real captures.}
+Real captures contain ambient illumination and additional camera-response
+uncertainties. Handling these effects is deferred; possible future options
+include an ambient term or flash/no-flash differencing, but neither is part
+of the Level-2 synthetic study.
+The initial synthetic subset disables ambient illumination where supported.
+If the renderer retains a nonzero ambient term, its setting is fixed and
+recorded; the analytic model is then treated as an approximation, and
+strongly affected samples are excluded from the primary experiment.
+
+\section{Training Objective}
+
+Let $\Omega_v$ denote valid foreground pixels for view $v$. Training runs on
+ordered pairs; for each ordered pair $(I_a,I_b)$, the photometric and
+derived-normal losses use the \emph{reference} outputs ($v=a$), which are
+camera-local. Both orderings of every pair are used. The initial training objective is
+\[
+  \boxed{
+  \Loss_{\mathrm{train}}
+  =
+  \lambda_{\mathrm{geo}}\Loss_{\mathrm{geo}}
+  +\lambda_{\mathrm{nrm}}\Loss_{\mathrm{nrm}}
+  +\lambda_{\mathrm{shade}}\Loss_{\mathrm{shade}}
+  +\lambda_{\rho}\Loss_{\rho}.
+  }
+\]
+There is no separate normal head and no normal-consistency term between two
+normal sources. Cross-view albedo consistency is outside the initial
+training objective. The photometric term is initially small and is warmed up only after the
+geometric prediction becomes stable.
+Operationally, $\lambda_{\mathrm{shade}}$ is held at zero until the
+validation $\Loss_{\mathrm{geo}}$ changes by less than $1\%$ over an
+epoch (or a fixed step count $T_0$ for reproducibility), then ramped
+linearly.
+
+\subsection{Confidence-weighted geometric regression}
+
+The geometric loss follows the confidence-weighted pointmap regression
+principle of DUSt3R:
+\[
+  \Loss_{\mathrm{geo}}
+  =
+  \sum_{v\in\{1,2\}}\sum_{\bm p\in\Omega_v}
+  \left[
+    C^{v,1}(\bm p)\,
+    \ell_{\mathrm{3D}}
+    \left(
+      X^{v,1}(\bm p),
+      \bar X^{v,1}(\bm p)
+    \right)
+    -\alpha_C\log C^{v,1}(\bm p)
+  \right].
+\]
+The precise regression norm and normalization protocol should match the
+selected DUSt3R training configuration. For lit metric samples the regression is on metric pointmaps with no scale
+normalization; for null-light or legacy samples, the
+original normalized geometric objective is retained.
+
+\subsection{Derived-normal supervision}
+
+Pointwise 3D regression tolerates high-frequency errors that strongly
+corrupt finite-difference normals, yet shading depends on exactly those
+derivatives. To supervise them without a normal head or ground-truth normals,
+apply the same operator $\mathcal N$ (including the same smoothing and masks)
+to the reference output and to the ground-truth pointmap:
+\[
+  \Loss_{\mathrm{nrm}}
+  =
+  \sum_{\bm p\in\Omega_a}
+  M_{\mathrm{edge}}^{\mathrm{gt}}(\bm p)\,M_{\mathrm{edge}}(\bm p)
+  \left(
+    1-\bm n_X\!\left(X^{a,a}\right)(\bm p)^{\!\top}
+    \bm n_X\!\left(\bar X^{a,a}\right)(\bm p)
+  \right).
+\]
+This is a gradient-matching term in the spirit of scale-shift-invariant
+depth losses. It applies to reference outputs only, because the normal
+sign convention is camera-specific.
+
+\subsection{Albedo supervision}
+
+For synthetic data with known albedo, use a logarithmic robust loss:
+\[
+  \Loss_\rho
+  =
+  \sum_v\sum_{\bm p\in\Omega_v}
+  \left\|
+    \log(\rho^v(\bm p)+\epsilon_\rho)
+    -
+    \log(\bar\rho^v(\bm p)+\epsilon_\rho)
+  \right\|_1.
+\]
+Bounded albedo is enforced by the sigmoid output parameterization. In the initial
+controlled setting, exposure, tone mapping, and renderer intensity settings
+are fixed and recorded rather than freely learned per image. This reduces
+confounding between reflectance, illumination, exposure, and geometry.
+
+\subsection{Photometric shading loss with reliability weights}
+
+For each ordered pair, compute the normal exclusively from the reference
+view's camera-local pointmap and evaluate a single shading pathway:
+\[
+  \widehat I^a
+  =
+  \Sshade
+  \left(
+    X^{a,a},
+    n_X(X^{a,a}),
+    \rho^a,
+    \mathcal Q_a,
+    V
+  \right).
+\]
+No pose is involved. Let $\psi(r)=\sqrt{r^2+\epsilon_\psi^2}$ be a robust penalty. For an RGB
+residual, $\psi$ may be applied channel-wise and summed, or applied to a
+specified robust RGB norm. Define
+\[
+  r^a(\bm p)
+  =
+  \psi\!\left(
+    \widehat I^a(\bm p)-I_a(\bm p)
+  \right).
+\]
+
+The shading loss is
+\[
+  \boxed{
+  \Loss_{\mathrm{shade}}
+  =
+  \sum_{a}\sum_{\bm p\in\Omega_a}
+  M_a(\bm p)
+  \left[
+    W^a(\bm p)r^a(\bm p)
+    -
+    \alpha_W\log(W^a(\bm p)+\epsilon_W)
+  \right],
+  }
+\]
+where the sum runs over the reference view of both orderings of each pair, and $M_a$ combines foreground, valid-depth,
+finite-difference-validity, discontinuity, non-saturated, and non-dark masks. For a scalar residual $\psi$, the pointwise minimizer
+of $W\psi-\alpha_W\log(W+\epsilon_W)$ over $0\leq W\leq1$ is
+\[
+  W^\star
+  =
+  \clip\!\left(\frac{\alpha_W}{\psi}-\epsilon_W,\,0,\,1\right).
+\]
+The logarithmic term discourages the reliability map from collapsing
+toward zero. Reliability distributions and the fraction of active pixels
+are monitored; the detached validity masks are not predicted by the network. The distribution of $W$ must be monitored during training to ensure
+that the model does not suppress most photometric supervision.
+
+\paragraph{What $W$ can and cannot mean.}
+At the optimum, $W\psi\approx\alpha_W$, so the loss acts as a learned
+iteratively reweighted robust penalty. $W$ cannot distinguish a model
+violation (specular highlight, cast shadow) from a geometry or albedo
+prediction error, since both raise the residual. It may down-weight pixels with large residuals regardless of whether the
+cause is a model violation or a prediction error. The ablation against a
+fixed robust (e.g.\ Cauchy) loss with no reliability head is essential; the
+fixed robust loss is the training baseline.
+
+The geometric normal is not detached by default: during training, the
+photometric pathway differentiates through the finite-difference
+normalization and into the pointmap. A stop-gradient variant may still
+be evaluated as a training-stability ablation, but it is not a separate
+regularizer.
+
+\subsection{Deferred cross-view albedo consistency}
+
+A future extension may use ground-truth or geometrically verified
+correspondences to tie albedo predictions across views. This could supply a
+multi-view photometric-stereo constraint, but it is excluded from the
+initial objective and experiments to avoid coupling the first study to
+correspondence quality and cross-view appearance consistency.
+\section{Training-Time Visibility and Robustness}
+
+The initial training objective uses the simple visibility approximation
+\[
+  V_k(\bm p)=1.
+\]
+For camera-attached lights close to the camera, cast shadows may be limited,
+and the clamp $\max(0,\bm n^\top\bm\omega_k)$ handles attached-shadow
+orientation but not occlusion by other scene geometry. Foreground, saturated,
+near-black, invalid-depth, and discontinuity masks are applied where
+appropriate. Robust photometric penalties and the learned reliability map
+reduce the influence of some model violations, including cast shadows.
+This is a deliberate simplification for the first training experiment, not
+a claim that shadows are physically absent. Explicit differentiable
+visibility and shadow tracing are deferred and are not part of either the
+initial training objective or inference-time global alignment.
+
+\section{Training Data and Protocol}
+
+\subsection{Controlled synthetic data}
+
+The initial dataset is generated in a metric simulator such as Gazebo. Scene
+geometry, camera poses, and camera-relative light positions are specified
+in meters. This establishes metric geometric ground truth, but does not by
+itself provide radiometrically calibrated images. The initial study is
+limited to Level 2: controlled illumination with recorded renderer settings.
+The data-generation protocol should include:
+\begin{itemize}
+  \item diffuse-dominant materials with known RGB albedo metadata, using a
+  consistent normalized reflectance convention;
+  \item direct point lights, initially one effective light per image (or
+  several simultaneous lights treated as one summed observation), with
+  renderer intensity and attenuation settings recorded;
+  \item camera-attached light positions expressed in camera coordinates,
+  with randomized offsets/intensity settings in one configuration and a
+  fixed-rig configuration in another;
+  \item fixed exposure, tone mapping, color pipeline, and renderer version;
+  if linear RGB output is available, retain it, otherwise document and
+  consistently apply the renderer's fixed image-encoding conversion;
+  \item known camera intrinsics, camera poses, metric depth/pointmaps,
+  albedo metadata, and foreground masks;
+  \item renderer normals may be exported for evaluation and diagnostics,
+  but are not required as a training target.
+\end{itemize}
+The attenuation model in the analytic shading surrogate must be documented
+and matched as closely as practical to the renderer configuration. It is
+not described as physically calibrated inverse-square illumination. The
+purpose is to test whether controlled illumination parameters offer
+useful additional supervision for geometry. Training and test splits must
+be separated by scene/object identity. Begin with simple diffuse scenes and
+increase geometric clutter only after the basic experiment is stable.
+
+\subsection{Mixing with general DUSt3R data}
+
+The original DUSt3R training mixture may be retained to reduce forgetting
+of general geometric capabilities. Samples without recorded illumination parameters
+use the null-light condition and geometric objective only. Photometric
+losses are applied only to samples with valid recorded light parameters and consistent renderer-image data. A frozen encoder, decoder LoRA, or gradual unfreezing
+can be compared.
+
+A crucial control is to fine-tune an otherwise equivalent DUSt3R model
+on the same synthetic images without light conditioning and without
+shading supervision. This separates the effect of controlled illumination
+from the effect of additional synthetic training data.
+
+\section{Experimental Plan and Evaluation}
+
+\subsection{Progressive experiments}
+
+All experiments are evaluated after the same standard geometric global
+alignment procedure. The purpose is to measure whether training-time
+photometric supervision improves the network's geometric predictions and,
+in turn, the globally aligned reconstruction. No experiment introduces a
+photometric objective into inference-time scene optimization.
+\begin{enumerate}
+  \item \textbf{E0 -- Geometric baselines:} evaluate the original DUSt3R
+  checkpoint and a DUSt3R model fine-tuned on the same Gazebo images using
+  geometric supervision only. The latter controls for the effect of
+  additional synthetic training data. Report a newer pose-free backbone
+  (e.g.\ MASt3R or VGGT) as an optional reference if resources permit.
+  \item \textbf{E1 -- Oracle-albedo shading supervision:} fine-tune the
+  geometric baseline with the derived-normal and shading losses, using
+  ground-truth albedo only to evaluate the training-time shading operator.
+  Ground-truth albedo is never supplied at inference. This isolates the
+  potential geometric benefit of the shading gradient under favorable
+  appearance information.
+  \item \textbf{E1b -- Predicted-albedo supervision:} replace oracle albedo
+  in the shading loss with the network's predicted albedo, supervised by
+  synthetic albedo metadata. This tests the jointly learned appearance and
+  geometry pathway under the intended inference setting.
+  \item \textbf{E2 -- Reliability supervision:} compare the learned
+  photometric-reliability head with a fixed robust penalty, keeping the
+  geometric global-alignment procedure unchanged.
+  \item \textbf{E3 -- Light-conditioned representation:} compare no explicit
+  light conditioning, light tokens (self-attention only), and FiLM on both
+  randomized-offset and fixed-rig data. All variants retain the same
+  training-time geometric and photometric objectives where applicable.
+\end{enumerate}
+The first milestone is E0 followed by E1: establish a same-data
+geometry-only control, then test whether the training-time shading signal
+improves pointmaps before introducing predicted albedo, reliability, and
+light-conditioning complexity.
+
+\subsection{Metrics}
+
+Report at least:
+\begin{itemize}
+  \item geometric accuracy, completeness, and symmetric Chamfer distance;
+  \item depth error and depth-relative error;
+  \item normal angular error, computed from the predicted pointmap against
+  renderer normals when such evaluation data is available (not as a
+  training requirement), reported alongside photometric error;
+  
+  \item relative camera pose metrics, such as rotation/translation
+  accuracy and mean average accuracy where applicable;
+  \item photometric reconstruction error in the fixed renderer-image encoding
+  (and in linear RGB when directly available);
+  \item sensitivity to perturbations in recorded light positions and renderer
+  intensity/attenuation settings;
+  \item the distribution of $W$ during training (to detect collapse or
+  excessive suppression of photometric supervision).
+\end{itemize}
+Photometric error is a training diagnostic, not a substitute for geometric
+evaluation. A model may reduce image residuals by changing albedo or
+reliability without improving geometry. The primary evidence for the
+research hypothesis must therefore come from pointmap and globally aligned
+geometric metrics on held-out scenes.
+
+\subsection{Required ablations}
+
+\begin{center}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.36\textwidth}X}
+\toprule
+Ablation & Question\\
+\midrule
+Original DUSt3R vs. geometry-only Gazebo fine-tuning &
+How much improvement comes from additional synthetic geometric training?\\
+Geometry-only vs. derived-normal supervision &
+Does explicit supervision of pointmap derivatives improve surface orientation?\\
+Oracle vs. predicted albedo in the training shading loss &
+How much of the shading-supervision benefit survives albedo prediction?\\
+Shading loss vs. no shading loss &
+Does the image-formation constraint improve geometry beyond geometric supervision?\\
+Learned reliability vs. fixed robust penalty &
+Does the reliability head improve robustness to violations of the simplified model?\\
+No light conditioning vs. light tokens vs. FiLM &
+Where and how should illumination enter the network?\\
+Randomized light offsets vs. fixed-rig illumination &
+Does view-dependent light conditioning improve generalization?\\
+Differentiable vs. stop-gradient derived normals &
+Are gradients through pointmap finite differences stable and useful?\\
+Accurate vs. perturbed light metadata &
+How sensitive is training-time photometric supervision to metadata errors?\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Expected failure modes}
+
+The following are hypotheses and anticipated limitations, not experimental
+results:
+\begin{itemize}
+  \item Photometric supervision may improve surface orientation and fine-scale
+  geometry more than coarse geometry.
+  \item With a single effective light and no cross-view albedo tie, albedo
+  and shading remain ambiguous and the normal is constrained only to a cone.
+  \item Non-Lambertian materials, interreflection, and cast shadows may
+  reduce the benefit of the v1 shading model.
+  \item Noisy pointmap derivatives may make geometric normals unstable;
+  validity-aware finite differences, controlled smoothing, derived-normal
+  supervision, and detached-normal ablations help diagnose this issue.
+  \item The shading loss may encourage the network to explain albedo or
+  renderer mismatch through geometry; oracle/predicted-albedo ablations,
+  geometric supervision, and held-out geometric metrics are needed to detect it.
+  \item $W$ may down-weight pixels with large residuals caused by either
+  model violations or prediction errors; it cannot distinguish the two.
+  \item Incorrect light-position or renderer-parameter metadata may produce
+  systematic geometric bias rather than merely higher photometric error.
+\end{itemize}
+
+\section{Inference Algorithm}
+
+For an input image collection, the inference procedure deliberately retains
+standard geometry-driven DUSt3R scene optimization:
+\begin{enumerate}
+  \item Provide the input images and, when the light-conditioned pathway is
+  enabled, their recorded camera-relative light parameters to the trained
+  LA-DUSt3R network.
+  \item Run the network on both orderings of selected image pairs and retain
+  the pairwise pointmaps and geometric-confidence predictions. Auxiliary
+  albedo and photometric-reliability outputs may be returned for diagnostics,
+  but are not used by scene optimization.
+  \item Run the standard DUSt3R geometric global-alignment procedure using
+  pairwise pointmaps and geometric confidence. Optimize the native geometric
+  alignment variables to estimate camera poses, focal lengths, and a globally
+  consistent reconstruction, preserving DUSt3R's original gauge and scale
+  parameterization.
+  \item Return the globally aligned 3D geometry, camera poses, and estimated
+  focal lengths. Pointmap-derived normals and auxiliary albedo predictions
+  may be computed or exported for evaluation, but they do not enter the
+  global-alignment objective.
+\end{enumerate}
+
+No ground-truth poses or geometry are used at inference. The differentiable
+shading operator, albedo loss, reliability-weighted photometric loss, and
+any depth-residual optimization are training-only components and are not
+evaluated during scene optimization. In particular, no photometric-family
+constraint is added to the geometric global-alignment objective.
+
+\section{Scope and Future Extensions}
+
+The initial LA-DUSt3R study is intentionally limited to Level-2 controlled
+synthetic illumination, camera-attached point lights with recorded
+renderer-space parameters, and diffuse-dominant Lambertian-like materials.
+The following extensions are deferred:
+\begin{enumerate}
+  \item differentiable visibility and screen-space shadow tracing;
+  \item unknown-light or environment-map estimation;
+  \item non-Lambertian reflectance, including specular BRDFs;
+  \item indirect illumination and radiosity-inspired transport;
+  \item cross-view albedo consistency and correspondence-driven
+  multi-view photometric-stereo constraints;
+  \item radiometrically calibrated illumination and recovery of absolute
+  metric scale from photometry (metric scale is supplied by geometric
+  supervision in the initial study);
+  \item any post-alignment photometric optimization of depth, albedo, camera
+  poses, or intrinsics; such refinement would require a separate study and
+  is not part of the proposed inference pipeline;
+  \item one-light-at-a-time multi-exposure capture, ambient-light handling
+  for real flash images, and transfer to newer backbones.
+\end{enumerate}
+The differentiable light-transport and surfel literature provides
+possible future directions, but its more elaborate transport solvers are
+not required for the initial direct-illumination surrogate
+\cite{gjerde2026point,jiang2025radiositygs}. A literature search on flash
+photometric stereo and feed-forward relightable reconstruction should be
+completed before claiming novelty.
+
+\section{Summary}
+
+LA-DUSt3R retains DUSt3R's pointmap-based geometric prior and augments the
+training architecture with controlled-illumination conditioning,
+diffuse-albedo and photometric-reliability prediction, pointmap-derived
+normals with explicit derivative supervision, and a differentiable
+Lambertian-like shading surrogate. The key consistency principle is to
+evaluate the training-time shading loss in each image's own camera frame
+using camera-local pointmaps from the swapped pair, without requiring camera
+poses for the photometric pathway. Metric scale is supplied by metric
+geometric supervision and is not recovered from illumination.
+
+The separation between training and inference is deliberate. Photometric
+constraints shape the learned geometric representation during training;
+inference uses pairwise pointmaps and geometric confidence followed by the
+standard DUSt3R geometric global alignment. No albedo, reliability, shading,
+or depth-residual objective is introduced into scene optimization. The
+initial experiments therefore test whether training-time photometric
+supervision improves the globally aligned geometry, while preserving a
+simple and well-understood inference procedure.
+
+\appendix
+
+\section{Revision notes for the revised v4.1}
+
+\begin{itemize}
+  \item Preserved the Level-2 controlled synthetic illumination scope and
+  metric geometric supervision from the refined v4.
+  \item Made the training/inference separation explicit: photometric losses
+  are used only during network training.
+  \item Removed the entire post-alignment photometric geometry-refinement
+  stage, including depth residuals, albedo priors, photometric alignment
+  objectives, and their optimization schedule.
+  \item Restored standard DUSt3R geometric global alignment as the sole
+  inference-time scene-optimization procedure, retaining its native gauge
+  and scale parameterization.
+  \item Clarified that inference-time global alignment uses pointmaps and
+  geometric confidence; albedo and reliability are auxiliary outputs only.
+  \item Reorganized experiments and ablations to measure the effect of
+  training-time shading, albedo, reliability, and light conditioning after
+  the same geometric global-alignment procedure.
+  \item Retained metric scale from metric geometric supervision; metric-scale
+  recovery from illumination and radiometric calibration remain deferred.
+\end{itemize}
+
+\section{Historical changes from v2 to v3 (superseded before revised v4.1)}
+
+The following bullets document intermediate design history only. Any
+post-alignment photometric optimization, depth-residual parameterization,
+albedo optimization, or photometric alignment objective mentioned in these
+notes is superseded and is not part of revised v4.1.
+
+\begin{itemize}
+  \item \textbf{Frames:} camera-local pointmaps come from the swapped pair
+  (no pose); pose-based conversion $T_{2\leftarrow1}$ demoted to an ablation
+  with the metric-scale caveat.
+  \item \textbf{Scale:} added a scalar per-pair scale head, a global metric
+  scale $s$ in alignment, and the prior
+  $\Loss_{\mathrm{sc}}=\sum_e(\log s+\log\sigma_e-\log s_e)^2$ tying it to
+  DUSt3R's $\sigma_e$ and gauge.
+  \item \textbf{Identifiability:} new Sec.~\ref{sec:ident} (cone constraint,
+  simultaneous lights sum, cross-view mechanism, scale--albedo degeneracy);
+  optional cross-view albedo term restored (training and alignment).
+  \item \textbf{Derivative supervision:} added $\Loss_{\mathrm{nrm}}$ using
+  the same operator on the ground-truth pointmap; added a coarse-to-fine
+  depth residual parameterization with penalty $\Loss_\delta$.
+  \item \textbf{Masks:} discontinuity mask now uses 3D neighbor spacing
+  versus pixel footprint, so grazing surfaces are retained.
+  \item \textbf{Light conditioning:} default is light tokens in
+  self-attention only (excluded from cross-attention keys); FiLM becomes an
+  ablation; H3 qualified for rigid rigs.
+  \item \textbf{Reliability:} documented what $W$ can and cannot mean; fixed
+  the minimizer to include $\epsilon_W$; fixed robust loss as baseline.
+  \item \textbf{Real data:} ambient-light and flash/no-flash note.
+  \item \textbf{Experiments:} E1b (estimated albedo), newer backbones in E0,
+  extended ablation table, $W$-distribution and normal-versus-photometric
+  monitoring.
+  \item \textbf{Notation and compile fixes:} single \texttt{xcolor} load;
+  $\Loss_\rho/\lambda_\rho$ for training albedo, $\Loss_{\mathrm{ap}}/\lambda_{\mathrm{ap}}$
+  for the alignment prior; $\Loss_{\mathrm{scale}}$ (training) distinguished from
+  $\Loss_{\mathrm{sc}}$ (alignment); redundant inference step removed.
+\end{itemize}
+
+\begin{thebibliography}{9}
+
+\bibitem{wang2024dust3r}
+S. Wang, V. Leroy, Y. Cabon, B. Chidlovskii, and J. Revaud,
+\newblock DUSt3R: Geometric 3D Vision Made Easy,
+\newblock in \emph{Proceedings of the IEEE/CVF Conference on Computer
+Vision and Pattern Recognition (CVPR)}, 2024.
+\newblock arXiv:2312.14132.
+\newblock \url{https://arxiv.org/abs/2312.14132}.
+\newblock Code: \url{https://github.com/naver/dust3r}.
+
+\bibitem{gjerde2026point}
+M. K. Gjerde, J. B. Haurum, J. R. Frisvad, M. Worchel,
+J. A. B{\ae}rentzen, and T. B. Moeslund,
+\newblock Point-Based 3D Reconstruction from Sparse Views under Known
+Illumination,
+\newblock arXiv:2608.20000, 2026.
+\newblock \url{https://arxiv.org/abs/2608.20000}.
+\newblock Code: \url{https://github.com/M-Gjerde/DifferentiablePointRendering}.
+
+\bibitem{jiang2025radiositygs}
+K. Jiang, J.-M. Sun, Z. Li, D. Wang, T.-M. Li, and R. Ramamoorthi,
+\newblock Differentiable Light Transport with Gaussian Surfels via
+Adapted Radiosity for Efficient Relighting and Geometry Reconstruction,
+\newblock \emph{ACM Transactions on Graphics}, SIGGRAPH Asia 2025.
+\newblock arXiv:2509.18497.
+\newblock \url{https://arxiv.org/abs/2509.18497}.
+\newblock Code: \url{https://github.com/RaymondJiangkw/RadiosityGS}.
+
+\end{thebibliography}
+
+\end{document}
